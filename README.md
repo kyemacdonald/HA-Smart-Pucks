@@ -16,5 +16,5 @@ Smart Speaker Box
 * 2" 4 Ohm 3W speaker
 * PCM5102A DAC
 
-Wiring Diagram
+Wiring Diagram for the Puck
 ![Circuit Image](circuit_image.png)
