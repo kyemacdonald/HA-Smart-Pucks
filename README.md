@@ -1,6 +1,8 @@
 # HA-Smart-Pucks
 Home Assistant Smart Speakers based on ESP32s running ESPhome
 
+<h2>Very much early stage. Use at own risk.</h2>
+
 Smart Puck
 * ESP32 S3 N16R8 / N8R2
 * MAX98357A Class D Amplifier
