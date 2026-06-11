@@ -15,3 +15,6 @@ Smart Speaker Box
 * 5V WS2812 8LED ring (outer diameter 27mm)
 * 2" 4 Ohm 3W speaker
 * PCM5102A DAC
+
+Wiring Diagram
+![Circuit Image](circuit_image.png)
