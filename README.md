@@ -18,7 +18,12 @@ Smart Speaker Box
 
 Smart Puck
 
-<img src="images/PXL_20260609_092055496.jpg" alt="Smart Puck" width="800">images/PXL_20260609_092055496.jpg>
+<img src="images/PXL_20260609_092055496.jpg" alt="Smart Puck" width="800">
+
+Smart Speaker Box
+
+<img src="images/PXL_20260608_213208450.jpg" alt="Smart Speaker Box" width="800">
 
 Wiring Diagram for the Puck
-![Circuit Image](circuit_image.png)
+<img src="circuit_image.png" alt="Circuit Image" width="800">
+
