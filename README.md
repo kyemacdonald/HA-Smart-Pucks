@@ -2,7 +2,7 @@
 Home Assistant Smart Speakers based on ESP32s running ESPhome
 
 Smart Puck
-* ESP32 S3 N16R8 
+* ESP32 S3 N16R8 / N8R2
 * MAX98357A Class D Amplifier
 * INMP441 Omnidirection Mic
 * 5V WS2812 24LED ring (outer diameter 72mm)
