@@ -29,3 +29,5 @@ Smart Speaker Box
 Wiring Diagram for the Puck
 <img src="circuit_image.png" alt="Circuit Image" width="800">
 
+Wiring Diagram for the Box
+<img src="circuit_image-smart-box.png" width="800">
