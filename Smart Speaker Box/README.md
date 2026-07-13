@@ -9,3 +9,6 @@ There are some limitations to this setup.  Media is streamed to the device and u
 The design setup is intended for 100% volume on both DACs.  This is a suitable volume level for the TTS output.  Adding it as a variable will likely happen in the future.
 
 Finally SendSpin is very CPU intensive, you need to specify that the player receives PCM output from MusicAssistant otherwise CPU will get overwhelmed and you will lose wakeword detection.  There is occasional audio corruption when playback first starts, transient for up to 2 seconds.  This is all caused by CPU bind.  
+
+13/7/26 Update
+Added timer support.  You will need the timer_done.mp3 and place into an audio directory under esphome
