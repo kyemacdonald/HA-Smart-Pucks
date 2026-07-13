@@ -30,6 +30,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: active_timer_count
+    type: int
+    restore_value: no
+    initial_value: '0'
 
 logger:
 
@@ -89,6 +93,8 @@ media_player:
     files:
       - id: alert_sound
         file: "audio/pop.mp3"
+      - id: timer_done_sound
+        file: "audio/timer_done.mp3"
     on_play:
       - switch.turn_on: amp_enable
       - light.turn_on:
@@ -120,6 +126,23 @@ media_player:
                   micro_wake_word.is_running:
           then:
             - micro_wake_word.start:
+      # If a timer is still active after this announcement finished (e.g. the
+      # timer-done chime just played), restore the timer-pulse LED instead of
+      # leaving it dark.
+      - if:
+          condition:
+            and:
+              - lambda: "return id(active_timer_count) > 0;"
+              - not:
+                  voice_assistant.is_running:
+          then:
+            - light.turn_on:
+                id: led_circle
+                brightness: 60%
+                red: 100%
+                green: 35%
+                blue: 0%
+                effect: "Slow Pulse"
 
 voice_assistant:
   id: assist
@@ -168,6 +191,68 @@ voice_assistant:
     - globals.set:
         id: tts_active
         value: 'false'
+
+  # --- Timer support (on-device, local to ESPHome) ---
+  # These triggers are what make HA report this device as supporting
+  # the HassStartTimer/HassCancelTimer/etc intents instead of returning
+  # "timers are not supported on this device". Timers themselves run
+  # entirely locally on the ESP32 — no HA round-trip required.
+  on_timer_started:
+    - globals.set:
+        id: active_timer_count
+        value: !lambda "return id(active_timer_count) + 1;"
+    - logger.log:
+        format: "Timer started: %s"
+        args: ["timer.name.c_str()"]
+    - if:
+        condition:
+          and:
+            - not:
+                voice_assistant.is_running:
+            - not:
+                media_player.is_playing: esps3_media_player
+        then:
+          - light.turn_on:
+              id: led_circle
+              brightness: 60%
+              red: 100%
+              green: 35%
+              blue: 0%
+              effect: "Slow Pulse"
+
+  on_timer_cancelled:
+    - globals.set:
+        id: active_timer_count
+        value: !lambda "return id(active_timer_count) > 0 ? id(active_timer_count) - 1 : 0;"
+    - logger.log:
+        format: "Timer cancelled: %s"
+        args: ["timer.name.c_str()"]
+    - if:
+        condition:
+          and:
+            - lambda: "return id(active_timer_count) <= 0;"
+            - not:
+                voice_assistant.is_running:
+        then:
+          - light.turn_off: led_circle
+
+  on_timer_finished:
+    - globals.set:
+        id: active_timer_count
+        value: !lambda "return id(active_timer_count) > 0 ? id(active_timer_count) - 1 : 0;"
+    - logger.log:
+        format: "Timer finished: %s"
+        args: ["timer.name.c_str()"]
+    - switch.turn_on: amp_enable
+    - delay: 50ms
+    - media_player.speaker.play_on_device_media_file:
+        media_file: timer_done_sound
+        announcement: true
+    # No manual LED handling needed here — esps3_media_player's
+    # on_announcement / on_idle chain already does the amp enable/disable
+    # sequencing and swirl, exactly like the wake-word chime does. The
+    # on_idle block above restores the timer-pulse LED afterward if any
+    # timers remain.
 
 switch:
   - platform: restart
