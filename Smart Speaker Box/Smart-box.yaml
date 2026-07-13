@@ -31,6 +31,578 @@ globals:
   - id: tts_active
     type: bool
     restore_value: no
+    initial_value: "false"
+  - id: pre_tts_volume
+    type: float
+    restore_value: no
+    initial_value: "1.0"
+  - id: volume_was_boosted
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: active_timer_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+logger:
+  logs:
+    sendspin.player: ERROR # Suppress "Failed to send audio chunk" warnings
+
+api:
+  on_client_connected:
+    then:
+      - delay: 500ms
+      - light.turn_off: led_circle
+      - micro_wake_word.start:
+  on_client_disconnected:
+    then:
+      - voice_assistant.stop:
+
+# I2S bus layout:
+#   mic_bus → INMP441 microphone          BCK: GPIO05  LRCK: GPIO04  DIN:  GPIO16
+#   spk_bus → MAX98357A + PCM5102A        BCK: GPIO47  LRCK: GPIO48  DOUT: GPIO21
+#             Both DACs share BCK/LRCK/DIN. Mute pins select which plays:
+#               MAX98357A SD:   GPIO02 (amp_enable)  — TTS/announcements
+#               PCM5102A  XSMT: GPIO06 (pcm_enable)  — media/music
+i2s_audio:
+  - id: mic_bus
+    i2s_lrclk_pin: GPIO04
+    i2s_bclk_pin: GPIO05
+
+  - id: spk_bus
+    i2s_lrclk_pin: GPIO48
+    i2s_bclk_pin: GPIO47
+
+microphone:
+  - platform: i2s_audio
+    id: mic
+    i2s_audio_id: mic_bus
+    adc_type: external
+    i2s_din_pin: GPIO16
+    channel: right
+    pdm: false
+
+speaker:
+  - platform: i2s_audio
+    id: spk_out
+    i2s_audio_id: spk_bus
+    i2s_dout_pin: GPIO21
+    dac_type: external
+    channel: stereo
+    sample_rate: 44100
+    bits_per_sample: 16bit
+    buffer_duration: 50ms
+
+  - platform: resampler
+    id: spk_resampler
+    output_speaker: spk_out
+    sample_rate: 44100
+    bits_per_sample: 16
+
+  # Queue mode: announcement_source has priority, then media, then sendspin.
+  - platform: mixer
+    id: spk_mixer
+    output_speaker: spk_resampler
+    queue_mode: true
+    source_speakers:
+      - id: announcement_source
+        buffer_duration: 20ms
+      - id: media_spk_source
+        buffer_duration: 20ms
+      - id: sendspin_source
+        buffer_duration: 20ms
+
+media_source:
+  - platform: sendspin
+    id: sendspin_media_source
+    sample_rate: 44100
+    task_stack_in_psram: true
+
+media_player:
+  - platform: speaker
+    id: esps3_media_player
+    name: VA Circle Media Player
+    buffer_size: 8192
+    volume_initial: 100%
+    volume_max: 100%
+    media_pipeline:
+      speaker: media_spk_source
+      format: MP3
+    announcement_pipeline:
+      speaker: announcement_source
+      format: MP3
+    files:
+      - id: timer_done_sound
+        file: "audio/timer_done.mp3" # Placed alongside this yaml. Encode at 44100 Hz, mono or stereo, 16-bit.
+    on_play:
+      # A slight delay guarantees on_announcement has time to set tts_active
+      # so standard media playback doesn't accidentally turn on PCM during TTS.
+      - delay: 50ms
+      - logger.log:
+          format: "esps3_media_player on_play fired, tts_active=%d"
+          args: ["id(tts_active)"]
+      - if:
+          condition:
+            and:
+              - lambda: return !id(tts_active);
+              - not:
+                  voice_assistant.is_running:
+          then:
+            - switch.turn_off: amp_enable
+            - switch.turn_off: pcm_enable
+            - delay: 300ms
+            - switch.turn_on: pcm_enable
+            - light.turn_on:
+                id: led_circle
+                brightness: 90%
+                effect: "Talking Swirl"
+    on_announcement:
+      # All TTS routing is centralized here to prevent double-execution races.
+      - globals.set:
+          id: tts_active
+          value: "true"
+      - if:
+          condition:
+            lambda: "return !id(volume_was_boosted);"
+          then:
+            - globals.set:
+                id: pre_tts_volume
+                value: !lambda "return id(esps3_media_player).volume;"
+            - globals.set:
+                id: volume_was_boosted
+                value: "true"
+            - media_player.volume_set:
+                id: esps3_media_player
+                volume: 1.0
+      - switch.turn_off: pcm_enable
+      - switch.turn_off: amp_enable
+      - delay: 300ms
+      - switch.turn_on: amp_enable
+      - light.turn_on:
+          id: led_circle
+          brightness: 90%
+          effect: "Talking Swirl"
+    on_pause:
+      - switch.turn_off: amp_enable
+      - switch.turn_off: pcm_enable
+      - light.turn_off: led_circle
+    on_idle:
+      # 1. The TTS announcement has physically finished. Turn off the Amp immediately.
+      - switch.turn_off: amp_enable
+
+      # 2. CLEAR the tts_active flag now that the buffer is physically empty
+      - globals.set:
+          id: tts_active
+          value: "false"
+
+      # 3. Restore the previous volume ONLY if it was actively boosted for TTS
+      - if:
+          condition:
+            lambda: "return id(volume_was_boosted);"
+          then:
+            - media_player.volume_set:
+                id: esps3_media_player
+                volume: !lambda "return id(pre_tts_volume);"
+            - globals.set:
+                id: volume_was_boosted
+                value: "false"
+
+      # 4. Wait a fraction of a second to prevent hardware audio popping.
+      - delay: 100ms
+
+      # 5. Check if background media is running. If it is, restore the PCM DAC.
+      - if:
+          condition:
+            media_player.is_playing: sendspin_audio_player
+          then:
+            - switch.turn_on: pcm_enable
+
+      # 6. Handle LEDs and Wake Word restart
+      - light.turn_off: led_circle
+      - delay: 500ms
+      - if:
+          condition:
+            and:
+              - not:
+                  voice_assistant.is_running:
+              - not:
+                  micro_wake_word.is_running:
+          then:
+            - micro_wake_word.start:
+      # 7. If a timer is still active after this announcement finished,
+      #    restore the timer-pulse LED instead of leaving it dark.
+      - if:
+          condition:
+            and:
+              - lambda: "return id(active_timer_count) > 0;"
+              - not:
+                  voice_assistant.is_running:
+          then:
+            - light.turn_on:
+                id: led_circle
+                brightness: 60%
+                red: 100%
+                green: 35%
+                blue: 0%
+                effect: "Slow Pulse"
+
+  # Sendspin group controller — transport/volume only, no audio output.
+  - platform: sendspin
+    id: sendspin_group_player
+    name: Sendspin Group Media Player
+
+  # Sendspin audio player — routes Sendspin audio through sendspin_source
+  # mixer slot → PCM DAC. Follows same DAC rules as HTTP media.
+  - platform: speaker_source
+    id: sendspin_audio_player
+    name: Sendspin Audio Player
+    media_pipeline:
+      speaker: sendspin_source
+      sources:
+        - sendspin_media_source
+    volume_initial: 100%
+    volume_max: 100%
+    on_play:
+      - delay: 50ms
+      - logger.log:
+          format: "sendspin_audio_player on_play fired, tts_active=%d"
+          args: ["id(tts_active)"]
+      - if:
+          condition:
+            and:
+              - lambda: return !id(tts_active);
+              - not:
+                  voice_assistant.is_running:
+          then:
+            - switch.turn_off: amp_enable
+            - switch.turn_off: pcm_enable
+            - delay: 300ms
+            - switch.turn_on: pcm_enable
+            - light.turn_on:
+                id: led_circle
+                brightness: 90%
+                effect: "Talking Swirl"
+    on_pause:
+      - switch.turn_off: pcm_enable
+      - switch.turn_off: amp_enable
+      - light.turn_off: led_circle
+    on_idle:
+      - switch.turn_off: pcm_enable
+      - switch.turn_off: amp_enable
+      - light.turn_off: led_circle
+
+voice_assistant:
+  id: assist
+  microphone: mic
+  media_player: esps3_media_player
+  micro_wake_word: mww
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 1.5
+  on_error:
+    - switch.turn_off: amp_enable
+    - switch.turn_off: pcm_enable
+    - if:
+        condition:
+          lambda: "return id(volume_was_boosted);"
+        then:
+          - media_player.volume_set:
+              id: esps3_media_player
+              volume: !lambda "return id(pre_tts_volume);"
+          - globals.set:
+              id: volume_was_boosted
+              value: "false"
+    # RESTORE PCM if media was playing and pipeline failed (no speech)
+    - if:
+        condition:
+          media_player.is_playing: sendspin_audio_player
+        then:
+          - switch.turn_on: pcm_enable
+    - light.turn_off: led_circle
+    - micro_wake_word.start:
+    - light.turn_on:
+        id: led_circle
+        red: 70%
+        green: 0%
+        blue: 0%
+        brightness: 40%
+        effect: "Error Swirl"
+    - delay: 3s
+    - light.turn_off: led_circle
+  on_end:
+    - logger.log: "VA Pipeline Ended"
+    - if:
+        condition:
+          lambda: return !id(tts_active);
+        then:
+          - delay: 200ms
+          # RESTORE PCM if media was playing and pipeline aborted normally
+          - if:
+              condition:
+                media_player.is_playing: sendspin_audio_player
+              then:
+                - switch.turn_on: pcm_enable
+          - micro_wake_word.start:
+  on_stt_end:
+    - light.turn_off: led_circle
+  on_tts_start:
+    # Just raise the flag early. esps3_media_player.on_announcement handles the hardware to prevent overlapping executions.
+    - globals.set:
+        id: tts_active
+        value: "true"
+  on_tts_end:
+    # Fires early on URL receipt. We let esps3_media_player.on_idle handle state cleanup when physical audio finishes.
+    - logger.log: "TTS Stream URL received"
+
+  # --- Timer support (on-device, local to ESPHome) ---
+  # These triggers are what make HA report this device as supporting
+  # the HassStartTimer/HassCancelTimer/etc intents instead of returning
+  # "timers are not supported on this device". Timers themselves run
+  # entirely locally on the ESP32 — no HA round-trip required.
+  on_timer_started:
+    - globals.set:
+        id: active_timer_count
+        value: !lambda "return id(active_timer_count) + 1;"
+    - logger.log:
+        format: "Timer started: %s"
+        args: ["timer.name.c_str()"]
+    - if:
+        condition:
+          and:
+            - not:
+                voice_assistant.is_running:
+            - not:
+                media_player.is_playing: esps3_media_player
+        then:
+          - light.turn_on:
+              id: led_circle
+              brightness: 60%
+              red: 100%
+              green: 35%
+              blue: 0%
+              effect: "Slow Pulse"
+
+  on_timer_cancelled:
+    - globals.set:
+        id: active_timer_count
+        value: !lambda "return id(active_timer_count) > 0 ? id(active_timer_count) - 1 : 0;"
+    - logger.log:
+        format: "Timer cancelled: %s"
+        args: ["timer.name.c_str()"]
+    - if:
+        condition:
+          and:
+            - lambda: "return id(active_timer_count) <= 0;"
+            - not:
+                voice_assistant.is_running:
+        then:
+          - light.turn_off: led_circle
+
+  on_timer_finished:
+    - globals.set:
+        id: active_timer_count
+        value: !lambda "return id(active_timer_count) > 0 ? id(active_timer_count) - 1 : 0;"
+    - logger.log:
+        format: "Timer finished: %s"
+        args: ["timer.name.c_str()"]
+    - media_player.speaker.play_on_device_media_file:
+        media_file: timer_done_sound
+        announcement: true
+    # No manual amp/LED handling needed here — esps3_media_player's
+    # on_announcement / on_idle chain already does the enable/disable
+    # sequencing and swirl, exactly like TTS does. Step 7 in that on_idle
+    # block restores the timer-pulse LED afterward if any timers remain.
+
+switch:
+  - platform: restart
+    name: "Restart Device"
+  - platform: gpio
+    pin: GPIO02
+    id: amp_enable
+    name: "Amplifier Output Enable"
+    restore_mode: ALWAYS_OFF
+  - platform: gpio
+    pin: GPIO06
+    id: pcm_enable
+    name: "PCM Output Enable"
+    restore_mode: ALWAYS_OFF
+  - platform: template
+    id: mute
+    name: mute
+    optimistic: true
+    on_turn_on:
+      - micro_wake_word.stop:
+      - voice_assistant.stop:
+      - switch.turn_off: amp_enable
+      - switch.turn_off: pcm_enable
+    on_turn_off:
+      - micro_wake_word.start:
+
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: mic
+    channels: 0
+    gain_factor: 3
+  vad:
+  models:
+    - model: okay_nabu
+      id: okay_nabu_model
+    - model: hey_jarvis
+      id: hey_jarvis_model
+  on_wake_word_detected:
+    - globals.set:
+        id: tts_active
+        value: "false"
+    # IMMEDIATELY mute PCM upon wake word to stop media output
+    - switch.turn_off: pcm_enable
+    - switch.turn_off: amp_enable
+    # Lock in the current volume RIGHT NOW before HA can send any overrides
+    - if:
+        condition:
+          lambda: "return !id(volume_was_boosted);"
+        then:
+          - globals.set:
+              id: pre_tts_volume
+              value: !lambda "return id(esps3_media_player).volume;"
+          - globals.set:
+              id: volume_was_boosted
+              value: "true"
+          - media_player.volume_set:
+              id: esps3_media_player
+              volume: 1.0
+    - micro_wake_word.stop:
+    - delay: 50ms
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+    - light.turn_off: led_circle
+    - light.turn_on:
+        id: led_circle
+        effect: "Listening Swirl"
+        brightness: 90%
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_circle
+    rgb_order: GRB
+    pin: GPIO13
+    num_leds: 8
+    chipset: ws2812
+    name: "light Ring"
+    effects:
+      - pulse:
+          name: "Fast Pulse"
+          transition_length: 0.45s
+          update_interval: 0.45s
+          min_brightness: 0%
+          max_brightness: 50%
+      - pulse:
+          name: "Slow Pulse"
+          transition_length: 2.0s
+          update_interval: 2.0s
+          min_brightness: 0%
+          max_brightness: 100%
+      - random:
+          name: "Random Colors"
+          transition_length: 1s
+          update_interval: 2s
+      - addressable_color_wipe:
+          name: "Listening Swirl"
+          colors:
+            - red: 0%
+              green: 80%
+              blue: 80%
+              num_leds: 5
+              gradient: true
+            - red: 0%
+              green: 0%
+              blue: 0%
+              num_leds: 3
+          add_led_interval: 60ms
+      - addressable_color_wipe:
+          name: Talking Swirl
+          colors:
+            - red: 50%
+              green: 0%
+              blue: 80%
+              num_leds: 5
+              gradient: true
+            - red: 0%
+              green: 0%
+              blue: 0%
+              num_leds: 3
+          add_led_interval: 70ms
+          reverse: True
+      - addressable_color_wipe:
+          name: Error Swirl
+          colors:
+            - red: 60%
+              green: 0%
+              blue: 0%
+              num_leds: 5
+              gradient: true
+            - red: 0%
+              green: 0%
+              blue: 0%
+              num_leds: 3
+          add_led_interval: 50ms
+          reverse: True
+      - flicker:
+          name: Flicker Effect
+          alpha: 95%
+          intensity: 1.5%
+      - addressable_scan:
+          name: Single Scan
+          move_interval: 30ms
+          scan_width: 1
+      - addressable_rainbow:
+          name: Rainbow Effect
+          speed: 12
+          width: 8
+      - addressable_twinkle:
+          name: Twinkly
+          twinkle_probability: 5%
+          progress_interval: 4ms
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_passwordesphome:
+  name: esphome-web-f82804
+  friendly_name: Smart Box 1
+  min_version: 2026.4.0
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
+      CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+sendspin:
+  id: sendspin_hub
+  task_stack_in_psram: true
+
+globals:
+  - id: tts_active
+    type: bool
+    restore_value: no
     initial_value: 'false'
   - id: pre_tts_volume
     type: float
